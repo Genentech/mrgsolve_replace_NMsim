@@ -7,7 +7,7 @@ You still need to develop `mrgsolve` model file, but from my experience that eff
 
 ## Quick look
 
-See https://github.com/Genentech/mrgsolve_replace_NMsim/01_mrgsolve_replace_NMsim.html for output from the RMarkdown template
+See https://genentech.github.io/mrgsolve_replace_NMsim/01_mrgsolve_replace_NMsim.html for output from the RMarkdown template
 
 
 ## How to use
