@@ -1,0 +1,18 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+.DS_Store
+*Icon
+
+script/*.html
+*.Rdata
+*.rds
+
+output*
+
+# For NONMEM and Pirana
+nm/modelfit_dir*
+nm/vpc_*/
+*.git_ini

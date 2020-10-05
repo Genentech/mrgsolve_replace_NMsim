@@ -1,0 +1,646 @@
+---
+title: "Use `mrgsolve` to replace NONMEM simulations"
+author: "Kenta Yoshida"
+date: "`r Sys.Date()`"
+output:  
+  html_document:
+    theme: cosmo
+    code_folding: hide
+    keep_md: yes
+    toc: yes
+    toc_depth: 2
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+---
+
+# Setup
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=6, fig.height=4)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+library(tidyverse)
+library(glue)
+library(xpose)
+library(mrgsolve)
+library(xgxr)
+library(tidyvpc)
+
+theme_set(theme_linedraw(base_size = 12))
+
+geomean <- function(x){exp(mean(log(x)))}
+quibble <- function(x, q = c(0.05, 0.5, 0.95)) {
+  tibble("{{ x }}" := quantile(x, q), 
+         "{{ x }}_q" := paste0("P",
+                               formatC(q * 100, width = 2, format = "d", flag = "0")))
+}
+# summarize(data, quibble(x))
+```
+
+
+# Preface
+
+See <https://github.com/Genentech/mrgsolve_replace_NMsim> for the code & files needed to run the examples in your environment
+
+## `mrgsolve` applications covered in this document
+
+In this file, the following four types of `mrgsolve` applications has been demonstrated:
+
+- Draw smooth PK profiles by adding observation time points in simulations
+- Clinical trial simulation with new dose amount and schedules
+- Obtain summary PK metrics (e.g. AUC<sub>ss</sub>, C<sub>min,ss</sub>, C<sub>min,ss</sub>) based on protocol-defined dosing schedules and empirical Bayes estimates (EBE) of individual ETA
+  - This is useful for generating metrics for E-R analysis
+- VPC
+
+
+## Notes
+
+- The model & data were from:
+  - *Nonlinear Mixed‐Effects Model Development and Simulation Using nlmixr and Related R Open‐Source Packages*, Fidler et al., CPT Pharmacometrics Syst Pharmacol. 2019 Sep;8(9):621-633.
+  - https://doi.org/10.1002/psp4.12445
+- `mrgsolve` version >= 0.10.4 is required
+- In these workflows, THETA (& SIGMA) is updated with values in input data frames, while OMEGA is updated with omat function to be applied on `mrgmod` object
+
+# Preparations
+
+## CSV data import
+### First modify data
+
+examplomycin.csv is obtained from Supplementary File 1 of the above article  
+Modification needed to be compatible with NONMEM  
+
+```{r, eval=FALSE}
+df.raw <- read_csv("data/examplomycin.csv")
+
+unique(df.raw$EVID)
+
+df.raw %>% 
+  mutate(CMT = ifelse(EVID == 101, 1, 2),
+         EVID = ifelse(EVID == 101, 1, 0),
+         PHASE = ifelse(TIME < 24, "SD", "MD")) %>% 
+  relocate(CMT, .after = DV) %>% 
+  rename(NMID = ID) %>% 
+  write_csv("data/examplomycin2.csv")
+
+```
+
+### Import modified data
+
+```{r}
+df.nm <- read_csv("data/examplomycin2.csv")
+df.nm.dose<- filter(df.nm, EVID == 1)
+df.nm.obs <- filter(df.nm, EVID == 0)
+
+time_units_dataset = "hours"
+time_units_plot    = "days"
+```
+
+## Load model files
+
+### `mrgsolve`
+
+```{r}
+mod_pk <- mread("mrgsolve/examplomycin_2cmt_covs_2020-07-08.cpp")
+see(mod_pk)
+```
+
+
+### NONMEM fit
+
+This is needed to extract population parameter estimates (THETA, OMEGA) as well as individuals (ETA).  
+
+Alternatively you can manually modify population parameters in the `mrgsolve` model file.  
+For ETA you most likely need to load NONMEM fit (unless you get EBE using R).  
+
+```{r}
+xpdb <- xpose_data(runno = "006", dir = "nm")
+
+df.theta <- 
+  get_prm(xpdb, transform = FALSE, quiet = TRUE) %>% 
+  filter(type == "the") %>% 
+  select(name, value) %>% 
+  pivot_wider() %>% 
+  rename(TVCL = THETA1,
+         TVV2 = THETA2,
+         TVV3 = THETA3,
+         TVQ  = THETA4,
+         TVKA = THETA5,
+         PROP = THETA6,
+         ADD  = THETA7,
+         WTCL = THETA11,
+         SEXV2= THETA12)
+
+df.eta <- 
+  get_data(xpdb, quiet = TRUE) %>% 
+  select(NMID, 
+         E_CLi = ETA1, 
+         E_V2i = ETA2, 
+         E_V3i = ETA3, 
+         E_Qi  = ETA4, 
+         E_KAi = ETA5) %>% 
+  distinct()
+
+omega.vec <- 
+  get_prm(xpdb, transform = FALSE, quiet = TRUE) %>% 
+  filter(type == "ome") %>% 
+  pull(value)
+
+d.omat <- 
+  omat(group1 = bmat(omega.vec[1:3]), group2 = dmat(omega.vec[4:6]))
+```
+
+
+
+# Draw smooth individual PK curve
+
+See https://mrgsolve.github.io/user_guide/topics.html#topic-designs for more details of specifying sampling designs
+
+## Run
+
+```{r}
+
+# Set-up datasets
+df.sim.act.dose <-
+  df.nm %>% 
+  # Add parameter values
+  expand_grid(df.theta) %>% 
+  mutate(ID = NMID)
+
+df.sim.act.dose.eta <-
+  df.nm %>% 
+  # Add parameter and ETA values
+  expand_grid(df.theta) %>% 
+  left_join(df.eta, by = "NMID") %>% 
+  mutate(ID = NMID)
+
+# Model run setting
+mod_pk.act.dose <- 
+  mod_pk %>% 
+  # Set Omega and Sigma to zero
+  zero_re() %>% 
+  # Keep these variables in the output
+  # a.u.g is a flag for augmented sampling timepoints
+  carry_out(NMID, AMT, EVID, WT, SEX, a.u.g) %>% 
+  # Specify that we want to add augmented timepoints (defined with delta)
+  obsaug()
+
+
+# PRED 
+## IPRED in output here is PRED because E_XXi is left at 0 and 
+## SIGMA and OMEGA were also set as 0
+mrgsim.pred.act.dose <- 
+  mod_pk.act.dose %>% 
+  data_set(df.sim.act.dose) %>%
+  mrgsim(end = 200, delta = 1,
+         recover = "PHASE")
+
+df.mrgsim.pred.act.dose <- 
+  as_tibble(mrgsim.pred.act.dose) %>% 
+  rename(PRED = IPRED)
+
+# IPRED
+mrgsim.ipred.act.dose <- 
+  mod_pk.act.dose %>% 
+  data_set(df.sim.act.dose.eta) %>%
+  mrgsim(end = 200, delta = 1,
+         recover = "PHASE")
+
+df.mrgsim.ipred.act.dose <- 
+  as_tibble(mrgsim.ipred.act.dose)
+
+```
+
+## Plot
+
+```{r, fig.width=6, fig.height=6}
+df.mrgsim.ipred.act.dose %>% 
+  ggplot(aes(TIME, IPRED)) +
+  geom_line() +
+  geom_line(data = df.mrgsim.pred.act.dose,
+            aes(y = PRED),
+            linetype = "dashed") +
+  geom_point(data = df.nm.obs,
+             aes(y = DV)) +
+  # Only show the first 12 subjects
+  facet_wrap_paginate(~NMID, nrow = 4, ncol = 4, page = 1,
+                      labeller = "label_both") +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot) +
+  labs(y = "Concentration",
+       caption = "Solid line: IPRED, Dashed line: PRED, Circles: Obs")
+```
+
+
+
+# Simulate new dose or schedules
+
+Regular NONMEM-format data frame (which you would export to CSV & use in NONMEM $SIM) would likely work as it is.  
+If you want to utilize `mrgsolve`'s helper functions to generate datasets, see https://mrgsolve.github.io/user_guide/data-set-chapter.html#creating-data-sets for details.  
+
+## Dose ranging
+### Generate sim data
+
+```{r}
+set.seed(1234)
+
+n.subj.per.dose <- 1000
+doses <- c(600, 1200, 2400)
+dosetime <- (0:14) * 24
+
+n.subj.all <- n.subj.per.dose * length(doses)
+
+# Generate dosing records
+
+df.dose <- 
+  tibble(AMT = rep(doses, each = n.subj.per.dose)) %>% 
+  mutate(NMID = row_number()) %>% 
+  mutate(CMT = 1, EVID = 1) %>% 
+  expand_grid(TIME = dosetime)
+
+# Here we are resampling covariates from the observed data
+df.cov <- 
+  df.nm %>% 
+  select(NMID, WT, SEX) %>% 
+  distinct() %>% 
+  slice_sample(n = n.subj.all, replace = TRUE) %>% 
+  mutate(NMID = row_number())
+
+
+df.sim.dose.range <- 
+  full_join(df.dose, df.cov, by = "NMID") %>% 
+  # Add parameter values
+  expand_grid(df.theta) %>%
+  mutate(ID = NMID,
+         NAMT = AMT)
+```
+
+
+### Run
+
+```{r}
+mrgsim.dose.range <- 
+  mod_pk %>% 
+  carry_out(NMID, NAMT, AMT, EVID, WT, SEX) %>% 
+  data_set(df.sim.dose.range) %>%
+  omat(d.omat) %>% 
+  mrgsim(end = max(dosetime) + 24, delta = 1)
+
+df.mrgsim.dose.range <- 
+  as_tibble(mrgsim.dose.range) %>% 
+  filter(EVID == 0) %>% 
+  mutate(NAMT = factor(NAMT))
+```
+
+
+### Plot
+
+```{r, fig.width=6, fig.height=3}
+df.mrgsim.dose.range.qtile <- 
+  df.mrgsim.dose.range %>% 
+  group_by(NAMT, TIME) %>% 
+  summarize(quibble(IPRED),
+            n = n(),
+            .groups = "drop") %>% 
+  pivot_wider(names_from = IPRED_q, values_from = IPRED)
+
+df.mrgsim.dose.range.qtile %>% 
+  ggplot(aes(TIME, P50, color = NAMT)) +
+  geom_line() +
+  geom_ribbon(aes(ymax = P95, ymin = P05, fill = NAMT),
+              alpha = .3, color = NA) +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot) +
+  facet_wrap(~NAMT, labeller = "label_both", nrow = 1) +
+  labs(title = "Simulated PK with three dose levels",
+       y = "Concentration")
+```
+
+### Generate exporure metrics
+
+This can be used for showing PK variability or as input for E-R predictions
+
+```{r}
+exposure.metrics.dose.range <- 
+  df.mrgsim.dose.range %>% 
+  filter(TIME >= max(dosetime),
+         TIME <= max(dosetime) + 24) %>% 
+  group_by(NMID, NAMT) %>% 
+  summarize(AUCss = max(AUCCENT) - min(AUCCENT),
+            Cmaxss = max(IPRED),
+            Cminss = min(IPRED),
+            .groups = "drop")
+
+exposure.metrics.dose.range
+
+exposure.metrics.qtile <- 
+  exposure.metrics.dose.range %>% 
+  pivot_longer(AUCss:Cminss, names_to = "metric") %>% 
+  group_by(NAMT, metric) %>% 
+  summarize(quibble(value), .groups = "drop") %>% 
+  pivot_wider(names_from = value_q, values_from = value)
+
+exposure.metrics.qtile
+
+exposure.metrics.dose.range %>% 
+  ggplot(aes(AUCss, NAMT, fill = NAMT, color = NAMT)) +
+  ggridges::geom_density_ridges(alpha = 0.5) +
+  scale_y_discrete(expand = c(0, 0)) +
+  ggridges::theme_ridges()
+```
+
+
+
+## Different treatment intervals
+
+You can use ii and addl statements like NONMEM
+
+### Generate sim data
+
+```{r}
+set.seed(1234)
+
+n.subj.per.dose <- 1000
+df.dose.interval.setting <- 
+  tribble(~AMT, ~II, ~ADDL, ~NDOSE,
+          600,  12,  29,    "600mg BID",
+          1200, 24,  14,    "1200mg QD")
+time.sim.end <- 15 * 24
+
+n.subj.all <- n.subj.per.dose * nrow(df.dose.interval.setting)
+
+# Generate dosing records
+
+df.dose <- 
+  df.dose.interval.setting %>% 
+  expand_grid(IDdummy = 1:n.subj.per.dose) %>% 
+  select(-IDdummy) %>% 
+  mutate(NMID = row_number(),
+         TIME = 0, CMT = 1, EVID = 1)
+
+# Here we are resampling covariates from the observed data
+df.cov <- 
+  df.nm %>% 
+  select(NMID, WT, SEX) %>% 
+  distinct() %>% 
+  slice_sample(n = n.subj.all, replace = TRUE) %>% 
+  mutate(NMID = row_number())
+
+
+df.sim.dose.intervals <- 
+  full_join(df.dose, df.cov, by = "NMID") %>% 
+  # Add parameter values
+  expand_grid(df.theta) %>%
+  mutate(ID = NMID)
+```
+
+
+### Run
+
+```{r}
+mrgsim.dose.intervals <- 
+  mod_pk %>% 
+  carry_out(NMID, AMT, EVID, WT, SEX) %>% 
+  data_set(df.sim.dose.intervals) %>%
+  omat(d.omat) %>% 
+  mrgsim(end = time.sim.end, delta = 1,
+         recover = "NDOSE")
+
+df.mrgsim.dose.intervals <- 
+  as_tibble(mrgsim.dose.intervals) %>% 
+  filter(EVID == 0)
+```
+
+
+### Plot
+
+```{r}
+df.mrgsim.dose.intervals.qtile <- 
+  df.mrgsim.dose.intervals %>% 
+  group_by(NDOSE, TIME) %>% 
+  summarize(quibble(IPRED),
+            n = n(),
+            .groups = "drop") %>% 
+  pivot_wider(names_from = IPRED_q, values_from = IPRED)
+
+df.mrgsim.dose.intervals.qtile %>% 
+  ggplot(aes(TIME, P50, color = NDOSE)) +
+  geom_line() +
+  geom_ribbon(aes(ymax = P95, ymin = P05, fill = NDOSE),
+              alpha = .3, color = NA) +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot) +
+  # facet_wrap(~DFREQ, labeller = "label_both", nrow = 1) +
+  labs(title = "Simulated PK with two dosing intervals",
+       y = "Concentration")
+```
+
+
+
+# Calc individual PK metrics
+
+Sometimes we want to generate PK metrics for each individual (e.g. AUC<sub>ss</sub>, C<sub>min,ss</sub>, C<sub>min,ss</sub>) with empirical Bayes estimates (EBE), using protocol-defined dosing schedules rather than actual dosing records.  
+This may be preferred in some situations where we want to avoid post-randomization bias.  
+
+
+## Run
+
+```{r}
+# 15-day QD dosing of 1200mg
+df.sim.prot.dose <- 
+  df.nm %>% 
+  select(NMID, WT, SEX) %>% 
+  distinct() %>% 
+  mutate(TIME = 0, AMT = 1200, II = 24, ADDL = 14, CMT = 1, EVID = 1) %>% 
+  # Add parameter and ETA values
+  expand_grid(df.theta) %>% 
+  left_join(df.eta, by = "NMID") %>% 
+  mutate(ID = NMID)
+
+time.sim.end <- 16 * 24
+
+
+# Model run setting
+mod_pk.prot.dose <- 
+  mod_pk %>% 
+  # Set Omega and Sigma to zero
+  zero_re() %>% 
+  # Keep these variables in the output
+  # a.u.g is a flag for augmented sampling timepoints
+  carry_out(NMID, AMT, EVID, WT, SEX, a.u.g) %>% 
+  # Specify that we want to add augmented timepoints (defined with delta)
+  obsaug()
+
+
+# IPRED
+mrgsim.ipred.prot.dose <- 
+  mod_pk.prot.dose %>% 
+  data_set(df.sim.prot.dose) %>%
+  mrgsim(end = time.sim.end, delta = 1)
+
+df.mrgsim.ipred.prot.dose <- 
+  as_tibble(mrgsim.ipred.prot.dose)
+
+```
+
+
+## Exporure metrics for individual subjects
+
+This can be used for E-R analysis
+
+```{r, fig.width=3, fig.height=5}
+# You can use PKNCA::pk.calc.auc if the mrgsolve model does not calculate AUC in ODE
+# exposure.metrics.ipred.prot.dose <- 
+#   df.mrgsim.ipred.prot.dose %>% 
+#   filter(TIME >= 15 * 24) %>% 
+#   mutate(TAD = TIME -15 * 24) %>% 
+#   group_by(NMID) %>% 
+#   summarize(AUCss = PKNCA::pk.calc.auc(IPRED, TAD),
+#             Cmaxss = max(IPRED),
+#             Cminss = min(IPRED),
+#             .groups = "drop")
+
+# If mrgsolve calculate cumulative AUC, then max(AUC) - min(AUC)
+# is AUC for the time interval
+exposure.metrics.ipred.prot.dose <- 
+  df.mrgsim.ipred.prot.dose %>% 
+  filter(TIME >= 15 * 24,
+         TIME <= 16 * 24) %>% 
+  group_by(NMID) %>% 
+  summarize(AUCss = max(AUCCENT) - min(AUCCENT),
+            Cmaxss = max(IPRED),
+            Cminss = min(IPRED),
+            .groups = "drop")
+
+exposure.metrics.ipred.prot.dose.plot <- 
+  exposure.metrics.ipred.prot.dose %>% 
+  pivot_longer(Cmaxss:Cminss) %>% 
+  mutate(x = rep(1:2, times = nrow(exposure.metrics.ipred.prot.dose)),
+         xj = jitter(x, amount = 0.09)) %>% 
+  select(-AUCss, -x)
+
+exposure.metrics.ipred.prot.dose.plot %>% 
+  pivot_wider(names_from = name,
+              values_from = c(value, xj)) %>% 
+  ggplot() +
+  geom_line(data = exposure.metrics.ipred.prot.dose.plot,
+            aes(x = xj, y = value, group = NMID),
+            alpha = 0.3) +
+  geom_point(aes(xj_Cmaxss, value_Cmaxss), color = "dodgerblue", size = 2, alpha = 0.6) +
+  geom_point(aes(xj_Cminss, value_Cminss), color = "darkorange", size = 2, alpha = 0.6) +
+  expand_limits(y = 0) +
+  scale_x_continuous(breaks = 1:2,
+                     labels = c("Cmax", "Cmin"),
+                     limits = c(0.5, 2.5)) +
+  labs(x = "Individual exposure metrics",
+       y = "")
+
+exposure.metrics.ipred.prot.dose
+```
+
+
+# VPC
+
+Here I used `tidyvpc` package
+
+## Run sim
+
+```{r}
+# Sim for VPC
+n.vpc <- 1000
+
+df.sim.vpc <-
+  df.nm %>% 
+  # Add parameter values
+  expand_grid(df.theta) %>% 
+  # Duplicate all records n.vpc times
+  # Need to give different ID#
+  expand_grid(REP = 1:n.vpc) %>% 
+  mutate(ID = NMID * n.vpc + REP) %>% 
+  arrange(REP, NMID, TIME, EVID)
+
+mrgsim.vpc <- 
+  mod_pk %>% 
+  carry_out(REP, NMID, AMT, EVID, WT, SEX) %>% 
+  data_set(df.sim.vpc) %>%
+  omat(d.omat) %>% 
+  mrgsim(tad = TRUE, recover = "PHASE")
+
+df.mrgsim.vpc <- 
+  as_tibble(mrgsim.vpc) %>% 
+  filter(EVID == 0)
+
+
+# Sim PRED (required for tidyvpc)
+df.sim.pred.for.vpc <-
+  df.nm %>% 
+  # Add parameter values
+  expand_grid(df.theta) %>% 
+  mutate(ID = NMID) 
+
+mrgsim.pred.for.vpc <- 
+  mod_pk %>% 
+  carry_out(NMID, AMT, EVID) %>% 
+  data_set(df.sim.pred.for.vpc) %>%
+  zero_re() %>% 
+  mrgsim(tad = TRUE, recover = "PHASE")
+
+df.tad.pred <- 
+  mrgsim.pred.for.vpc %>% 
+  filter(EVID == 0) %>% 
+  # Here IPRED is PRED as zero_re was used
+  select(tad, PRED = IPRED)
+```
+
+
+## Generate VPC
+
+```{r}
+vpc <- 
+  df.nm.obs %>% 
+  bind_cols(df.tad.pred) %>% 
+  mutate(PHASE = factor(PHASE, levels = c("SD", "MD"))) %>% 
+  observed(x=TIME, y=DV) %>%
+  simulated(df.mrgsim.vpc, y=DV) %>%
+  stratify(~PHASE) %>% 
+  # binning(bin = NTIM) %>% 
+  binning(bin = "breaks", breaks = c(0, 1, 4, 5, 12, 24, 171, 185, 200)) %>% 
+  vpcstats()
+
+plot(vpc) +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot,
+                         breaks = (0:40) * 6)
+```
+
+
+## VPC with TAD
+
+We can use time after dose (TAD) calculated in `mrgsim()` and use that for VPC plot, even if you don't have TAD in your original dataset
+
+```{r}
+vpc <- 
+  df.nm.obs %>% 
+  bind_cols(df.tad.pred) %>% 
+  mutate(PHASE = factor(PHASE, levels = c("SD", "MD"))) %>% 
+  observed(x=tad, y=DV) %>%
+  simulated(df.mrgsim.vpc, y=DV) %>%
+  binning(bin = "breaks", breaks = c(0, 1, 4, 5, 12, 22, 30)) %>%
+  predcorrect(pred=PRED) %>%
+  vpcstats()
+
+plot(vpc) +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot,
+                         breaks = (0:40) * 6) +
+  labs(x = "Time after the last dose (Days)")
+```
+
+
+# Session info
+
+```{r}
+devtools::session_info()
+```
+
+

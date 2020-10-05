@@ -1,0 +1,431 @@
+---
+title: "Make sure mrgsolve model replicate NONMEM sim"
+author: "Kenta Yoshida"
+date: "`r Sys.Date()`"
+output:  
+  html_document:
+    theme: cosmo
+    code_folding: hide
+    keep_md: yes
+    toc: yes
+    toc_depth: 1
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+---
+
+# Setup
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=6, fig.height=4)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+library(tidyverse)
+library(glue)
+library(xpose)
+library(mrgsolve)
+library(xgxr)
+library(tidyvpc)
+
+theme_set(theme_linedraw(base_size = 12))
+
+geomean <- function(x){exp(mean(log(x)))}
+quibble <- function(x, q = c(0.05, 0.5, 0.95)) {
+  tibble("{{ x }}" := quantile(x, q), 
+         "{{ x }}_q" := paste0("P",
+                               formatC(q * 100, width = 2, format = "d", flag = "0")))
+}
+# summarize(data, quibble(x))
+```
+
+
+# Notes
+
+Validation worked fine
+
+- The model & data were from:
+  - *Nonlinear Mixed‐Effects Model Development and Simulation Using nlmixr and Related R Open‐Source Packages*, Fidler et al., CPT Pharmacometrics Syst Pharmacol. 2019 Sep;8(9):621-633.
+  - https://doi.org/10.1002/psp4.12445
+- `mrgsolve` version >= 0.10.4 is required
+
+# Import data
+
+## First modify data
+
+```{r, eval=FALSE}
+df.raw <- read_csv("data/examplomycin.csv")
+
+unique(df.raw$EVID)
+
+df.raw %>% 
+  mutate(CMT = ifelse(EVID == 101, 1, 2),
+         EVID = ifelse(EVID == 101, 1, 0),
+         PHASE = ifelse(TIME < 24, "SD", "MD")) %>% 
+  relocate(CMT, .after = DV) %>% 
+  rename(NMID = ID) %>% 
+  write_csv("data/examplomycin2.csv")
+
+```
+
+## Import modified data
+
+```{r}
+df.nm <- read_csv("data/examplomycin2.csv")
+df.nm.dose<- filter(df.nm, EVID == 1)
+df.nm.obs <- filter(df.nm, EVID == 0)
+
+time_units_dataset = "hours"
+time_units_plot    = "days"
+```
+
+# Load model file
+
+```{r}
+mod_pk <- mread("mrgsolve/examplomycin_2cmt_covs_2020-07-08.cpp")
+```
+
+# Import NONMEM fit
+
+```{r}
+xpdb <- xpose_data(runno = "006", dir = "nm")
+
+df.theta <- 
+  get_prm(xpdb, transform = FALSE, quiet = TRUE) %>% 
+  filter(type == "the") %>% 
+  select(name, value) %>% 
+  pivot_wider() %>% 
+  rename(TVCL = THETA1,
+         TVV2 = THETA2,
+         TVV3 = THETA3,
+         TVQ  = THETA4,
+         TVKA = THETA5,
+         PROP = THETA6,
+         ADD  = THETA7,
+         WTCL = THETA11,
+         SEXV2= THETA12)
+
+df.eta <- 
+  get_data(xpdb, quiet = TRUE) %>% 
+  select(NMID, 
+         E_CLi = ETA1, 
+         E_V2i = ETA2, 
+         E_V3i = ETA3, 
+         E_Qi  = ETA4, 
+         E_KAi = ETA5) %>% 
+  distinct()
+
+omega.vec <- 
+  get_prm(xpdb, transform = FALSE, quiet = TRUE) %>% 
+  filter(type == "ome") %>% 
+  pull(value)
+
+d.omat <- 
+  omat(group1 = bmat(omega.vec[1:3]), group2 = dmat(omega.vec[4:6]))
+```
+
+# Sim with actual dosing record
+
+## Run
+
+```{r}
+df.sim.actdose <-
+  df.nm %>% 
+  # Add parameter and ETA values
+  expand_grid(df.theta) %>% 
+  left_join(df.eta, by = "NMID") %>% 
+  rename(ID = NMID)
+
+
+mod_pk.actdose <- 
+  mod_pk %>% 
+  zero_re() %>% 
+  carry_out(AMT, EVID, WT, SEX, a.u.g) %>% 
+  obsaug()
+
+mrgsim.pred.actdose <- 
+  mod_pk.actdose %>% 
+  data_set(select(df.sim.actdose, !starts_with("E_"))) %>%
+  mrgsim(end = 200, delta = 1,
+         recover = "PHASE")
+
+mrgsim.ipred.actdose <- 
+  mod_pk.actdose %>% 
+  data_set(df.sim.actdose) %>%
+  mrgsim(end = 200, delta = 1,
+         recover = "PHASE")
+
+
+df.mrgsim.pred.actdose <- 
+  as_tibble(mrgsim.pred.actdose) %>% 
+  rename(NMID = ID,
+         PRED = IPRED)
+
+df.mrgsim.ipred.actdose <- 
+  as_tibble(mrgsim.ipred.actdose) %>% 
+  rename(NMID = ID)
+
+```
+
+## Plot
+
+```{r}
+df.mrgsim.ipred.actdose %>% 
+  ggplot(aes(TIME, IPRED)) +
+  geom_line() +
+  geom_line(data = df.mrgsim.pred.actdose,
+            aes(y = PRED),
+            linetype = "dashed") +
+  geom_point(data = df.nm.obs,
+             aes(y = DV)) +
+  # Only show the first 12 subjects
+  facet_wrap_paginate(~NMID, nrow = 3, ncol = 4, page = 1,
+                      labeller = "label_both") +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot) +
+  labs(caption = "Solid line: IPRED, Dashed line: PRED, Circles: Obs")
+```
+
+
+## Compare between NONMEM and mrgsolve
+
+```{r}
+df.joined <- 
+  bind_cols(df.mrgsim.ipred.actdose %>% 
+              arrange(NMID, TIME) %>% 
+              filter(a.u.g == 0, EVID == 0) %>% 
+              select(NMID, TIME, IPRED_MRG = IPRED),
+            get_data(xpdb, quiet = TRUE) %>%
+              arrange(NMID, TIME) %>%  
+              filter(EVID == 0) %>% 
+              select(IPRED_NM = IPRED))
+
+df.joined
+
+qplot(IPRED_MRG, IPRED_NM, data = df.joined) +
+  geom_abline(slope = 1, intercept = 0)
+```
+
+# DV comparison including VPC
+
+## Run
+
+### NONMEM
+
+`vpc -samples=500 -auto_bin=auto -dir=vpc_run006_500 -predcorr -nodes=8 run006.mod`
+
+```{r, eval=FALSE}
+
+df.nm.vpc.output.raw <-
+  read_table("nm/vpc_run006_500/m1/vpc_simulation.1.npctab.dta",
+             col_types = cols(.default = col_double()),
+             skip = 1) %>% 
+  filter(!is.na(ID))
+
+n.reps.vpc <- nrow(df.nm.vpc.output.raw) / nrow(df.nm)
+
+df.nm.vpc.output <- 
+  df.nm.vpc.output.raw %>% 
+  mutate(REP = rep(1:n.reps.vpc, each = nrow(df.nm))) %>% 
+  filter(MDV == 0)
+
+save(df.nm.vpc.output, file = "nm/vpc/vpc.run006.Rdata")
+```
+
+```{r}
+load("nm/vpc/vpc.run006.Rdata")
+
+df.nm.vpc.output
+```
+
+### mrgsolve
+
+```{r}
+n.vpc <- 1000
+
+df.sim.vpc <-
+  df.nm %>% 
+  # Add parameter values
+  expand_grid(df.theta) %>% 
+  rename(ID = NMID) %>% 
+  # Duplicate all records n.vpc times
+  expand_grid(REP = 1:n.vpc) %>% 
+  mutate(NMID = ID,
+         ID = ID * n.vpc + REP) %>% 
+  arrange(REP, NMID, TIME, EVID)
+
+mrgsim.vpc <- 
+  mod_pk %>% 
+  carry_out(REP, NMID, AMT, EVID, WT, SEX) %>% 
+  data_set(df.sim.vpc) %>%
+  omat(d.omat) %>% 
+  mrgsim(recover = "PHASE")
+
+df.mrgsim.vpc <- 
+  as_tibble(mrgsim.vpc) %>% 
+  filter(EVID == 0)
+```
+
+## Quantiles of DV for each individual
+
+```{r}
+df.nm.vpc.qtile <- 
+  df.nm.vpc.output %>% 
+  rename(NMID = ID) %>% 
+  group_by(NMID, TIME) %>% 
+  summarize(quibble(DV),
+            n = n(),
+            .groups = "drop")
+
+df.vpc.qtile <- 
+  df.mrgsim.vpc %>% 
+  group_by(NMID, TIME) %>% 
+  summarize(quibble(DV),
+            n = n(),
+            .groups = "drop")
+```
+
+```{r}
+df.nm.vpc.qtile %>% 
+  ggplot(aes(TIME, DV, group = DV_q, color = DV_q)) +
+  geom_line() +
+  geom_point(data = df.vpc.qtile) +
+  coord_cartesian(xlim = c(0, 25)) +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot) +
+  facet_wrap_paginate(~NMID, nrow = 3, ncol = 4, page = 1,
+                      labeller = "label_both") +
+  labs(caption = "Lines: NONMEM, Points: mrgsolve")
+
+df.nm.vpc.qtile %>% 
+  ggplot(aes(TIME, DV, group = DV_q, color = DV_q)) +
+  geom_line() +
+  geom_point(data = df.vpc.qtile) +
+  coord_cartesian(xlim = c(160, 200)) +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot) +
+  facet_wrap_paginate(~NMID, nrow = 3, ncol = 4, page = 1,
+                      labeller = "label_both") +
+  labs(caption = "Lines: NONMEM, Points: mrgsolve")
+
+```
+
+## Generate VPC
+
+```{r}
+d.pred <- 
+  df.mrgsim.pred.actdose %>% 
+  filter(a.u.g == 0, EVID == 0) %>% 
+  pull(PRED)
+
+vpc <- 
+  df.nm.obs %>% 
+  mutate(PRED = d.pred,
+         NTIM = TIME,
+         PHASE = factor(PHASE, levels = c("SD", "MD"))) %>% 
+  observed(x=TIME, y=DV) %>%
+  simulated(df.mrgsim.vpc, y=DV) %>%
+  stratify(~PHASE) %>% 
+  # binning(bin = NTIM) %>% 
+  binning(bin = "breaks", breaks = c(1, 4, 5, 12, 24, 171, 185, 200)) %>% 
+  vpcstats()
+
+vpc.nm <- 
+  df.nm.obs %>% 
+  mutate(PRED = d.pred,
+         NTIM = TIME,
+         PHASE = factor(PHASE, levels = c("SD", "MD"))) %>% 
+  observed(x=TIME, y=DV) %>%
+  simulated(df.nm.vpc.output, y=DV) %>%
+  stratify(~PHASE) %>% 
+  # binning(bin = NTIM) %>% 
+  binning(bin = "breaks", breaks = c(1, 4, 5, 12, 24, 171, 185, 200)) %>% 
+  vpcstats()
+
+
+plot(vpc) + coord_cartesian(ylim = c(0, 1000))
+plot(vpc.nm) + coord_cartesian(ylim = c(0, 1000))
+```
+
+# IPRED comparison (with ETA resampling)
+
+## Run
+
+### NONMEM
+
+```{r, eval=FALSE}
+
+df.nmsim.output.raw <-
+  read_table("nm/run006_sim.tab",
+             col_types = cols(.default = col_double()),
+             skip = 1) %>% 
+  filter(!is.na(ID))
+
+n.reps.vpc <- nrow(df.nmsim.output.raw) / nrow(df.nm)
+
+df.nmsim.output <- 
+  df.nmsim.output.raw %>% 
+  mutate(REP = rep(1:n.reps.vpc, each = nrow(df.nm))) %>% 
+  filter(EVID == 0)
+
+save(df.nmsim.output, file = "nm/vpc/nmsim.run006_sim.Rdata")
+```
+
+```{r}
+load("nm/vpc/nmsim.run006_sim.Rdata")
+
+df.nmsim.output
+```
+
+
+## Quantile of IPRED for each individual
+
+```{r}
+df.nmsim.ipred.qtile <- 
+  df.nmsim.output %>% 
+  group_by(NMID, TIME) %>% 
+  summarize(quibble(IPRED),
+            n = n(),
+            .groups = "drop")
+
+df.ipred.qtile <- 
+  df.mrgsim.vpc %>% 
+  group_by(NMID, TIME) %>% 
+  summarize(quibble(IPRED),
+            n = n(),
+            .groups = "drop")
+```
+
+```{r}
+df.nmsim.ipred.qtile %>% 
+  ggplot(aes(TIME, IPRED, group = IPRED_q, color = IPRED_q)) +
+  geom_line() +
+  geom_point(data = df.ipred.qtile) +
+  coord_cartesian(xlim = c(0, 25)) +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot) +
+  facet_wrap_paginate(~NMID, nrow = 3, ncol = 4, page = 1,
+                      labeller = "label_both") +
+  labs(caption = "Lines: NONMEM, Points: mrgsolve")
+
+df.nmsim.ipred.qtile %>% 
+  ggplot(aes(TIME, IPRED, group = IPRED_q, color = IPRED_q)) +
+  geom_line() +
+  geom_point(data = df.ipred.qtile) +
+  coord_cartesian(xlim = c(160, 200)) +
+  xgx_scale_x_time_units(units_dataset = time_units_dataset, 
+                         units_plot    = time_units_plot) +
+  facet_wrap_paginate(~NMID, nrow = 3, ncol = 4, page = 1,
+                      labeller = "label_both") +
+  labs(caption = "Lines: NONMEM, Points: mrgsolve")
+
+```
+
+
+
+# Session info
+
+```{r}
+devtools::session_info()
+```
+
+
